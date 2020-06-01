@@ -1,0 +1,211 @@
+import pandas as pd
+import numpy as np
+from openpyxl import Workbook
+from openpyxl import load_workbook
+import sys
+import pymysql
+import os
+from configparser import ConfigParser
+import datetime
+
+
+
+
+def SQL():
+    db_connection = pymysql.connect(user=db_username, passwd=db_password,
+                                host="db-prod-1.dso.nbg.solactive.com", port=3306, autocommit=True)
+    sql_select_Query="""
+
+    SELECT tm.SUNID, tm.ValidFrom, tm.ValidTo, tm.DataSetId, tm.ISIN, tm.SEDOL, tm.CUSIP, tm.OpMIC, tm.CompanyName, tm.RIC, tm.BBEx, tm.BBComp, tm.PvId, tm.FabianID,tm.FSEx, tm.Currency, tm.CoI,  tm.Sunid FROM EPD.TickerMap tm 
+    WHERE ValidTo > "3000-09-28" 
+
+    """
+    cursor = db_connection.cursor()
+    cursor.execute(sql_select_Query)
+    result=cursor.fetchall()
+
+    columns = [desc[0] for desc in cursor.description]
+    result = pd.DataFrame(list(result), columns=columns)
+    return result
+
+def date_setup():
+    wb=load_workbook(r"xxx")
+    ws=wb['Instructions']
+    date=ws['G11'].value # this is a problem
+
+    tdelta=datetime.timedelta(days=+30)
+    universe_begin_date=date-tdelta
+    end_date=date+tdelta
+
+    #date=date.strftime("%Y-%m-%d")
+    #universe_begin_date=universe_begin_date.strftime("%Y-%m-%d")
+    universe_end_date=date
+    #date=date.strftime("%Y-%m-%d")
+    begin_date=date
+    end_date=date
+    return begin_date, end_date, universe_begin_date, universe_end_date
+
+
+
+def calendar(df, period,begin_date,end_date):
+    calendar=pd.DataFrame()
+    calendar['rebalancing_date']=df.index
+    calendar['252days_ago']=df.index
+    calendar['252days_ago']=calendar['252days_ago'].shift(+251)
+
+    calendar.index=calendar.rebalancing_date
+    calendar_Q=calendar.resample(period).last().asfreq(period)
+    calendar_Q.index=calendar_Q.rebalancing_date
+    calendar_Q_adj=calendar_Q.loc[begin_date:end_date,:]
+    return calendar_Q_adj
+
+
+def universe_date_adj(universe, begin_date, end_date):
+    universe.columns=pd.to_datetime(universe.columns)
+    universe=universe.loc[:,begin_date:end_date]
+    universe.columns=calendar_Q_adj['rebalancing_date']
+    return universe
+
+
+
+
+def ds_vol(df, period,shift):
+    ds_vol=pd.DataFrame()
+    dt=pd.DataFrame()
+    for i in range(len(calendar_Q_adj.index)):
+        dt=df.pct_change()
+        dt=dt[dt<0]
+        dt=dt.fillna(0)
+        
+        begin_date=calendar_Q_adj.iloc[i,1]
+        end_date=calendar_Q_adj.iloc[i,0]
+        dt=dt[(dt.index>=begin_date) & (dt.index<=end_date)]
+        dt=dt.std()*252**(0.5)
+        ds_vol[calendar_Q_adj.iloc[i,0]]=dt
+    return ds_vol
+
+
+
+
+def universe_screen(universe):
+    screen=universe>0
+    screen=screen.astype('int32')
+    screen.sort_index()
+    return screen
+
+
+
+
+def trading_day_check(df):
+    trading=pd.DataFrame()
+    for i in range(len(calendar_Q_adj.index)):
+        begin_date=calendar_Q_adj.iloc[i,1]
+        end_date=calendar_Q_adj.iloc[i,0]
+        check=df[(df.index>=begin_date)&(df.index<=end_date)].isnull()
+        check=check.astype('int32').sum(axis=0)==0
+        check=check.astype('int32')
+        trading[calendar_Q_adj.iloc[i,0]]=check
+        trading.index.name = 'SUNID'
+        trading.sort_index()
+    return trading
+
+
+
+def eligible(universe_screen,trading_day_check):
+    eligible=universe_screen*trading_day_check
+    return eligible
+
+
+def inverse_vol(ds_vol):
+    inverse_vol=1/ds_vol
+    inverse_vol=inverse_vol.replace(np.inf, np.nan)
+    inverse_vol=inverse_vol.fillna(0)
+    return inverse_vol
+
+
+
+def top100_inverse_vol(inverse_vol):
+    eligible_inverse_vol=inverse_vol*eligible
+    top100_inverse_vol=eligible_inverse_vol.rank(axis=0, ascending=0)<=100
+    top100_inverse_vol=top100_inverse_vol.astype('int32')
+    top100_inverse_vol=top100_inverse_vol.fillna(0)
+    top100_inverse_vol=top100_inverse_vol*inverse_vol
+    return top100_inverse_vol
+
+
+
+def initial_weight(top100_inverse_vol):
+    weight=top100_inverse_vol/top100_inverse_vol.sum(axis=0)
+    weight.index.name='SUNID'
+    return weight
+
+def capped_weight(weight):
+    while ((weight>wgt_limit).any()).any():
+            weight[weight>wgt_limit]=wgt_limit
+            weight=weight/weight.sum(axis=0)
+            if ((weight==wgt_limit).any()).any():
+                break
+    return weight
+
+
+def output(weight):
+    #sunid_mapping=SQL(SQL_path)
+    #path_excel=r'T:\EquityPd\1-Projects\Janus Henderson\Low Volatility\1-Selection\1.Universe_python\SUNID.xlsx'
+    #sunid_mapping=pd.read_excel(path_excel)
+    sunid_mapping=SQL()
+    sunid_mapping=sunid_mapping[['ISIN','SUNID','CompanyName', 'RIC']]
+    sunid_mapping.set_index('SUNID', inplace=True)
+    final_weight=pd.merge(sunid_mapping,weight, how='inner', left_index=True, right_index=True)
+    final_weight=final_weight.reset_index().set_index(['ISIN','SUNID','CompanyName', 'RIC'])
+    final_weight=final_weight.loc[(final_weight!=0).any(axis=1)]
+    final_weight=final_weight.sort_values(by=begin_date, ascending=False)
+    final_weight.to_excel(r"xxx.xlsx")
+    return final_weight
+
+
+#Importing price data
+file=r"xxx"
+df=pd.read_excel(file, sheet_name='Price',parse_dates=True, index_col=0, header=4)
+#universe=pd.read_excel(file, sheet_name='Universe',header=1, parse_dates=True, index_col=0)
+
+
+# Load config file
+config_file = ConfigParser()
+config_file.read("T:/EquityPd/4-Tools/Python/EPD Tools/epd_tools/config.txt")
+db_username = config_file["DATABASE"]["username"]
+db_password = config_file["DATABASE"]["password"]
+
+#date setup
+begin_date=date_setup()[0]
+end_date=date_setup()[1]
+universe_begin_date=date_setup()[2]
+universe_end_date=date_setup()[3]
+
+#input data
+period='Q-JAN' #choose 'Y', 'Q', 'M'
+shift=-4 #-4 if 'Q' and the reference date is 1yr ago
+wgt_limit=0.03
+calendar_Q_adj=calendar(df, period,begin_date,end_date)
+#universe=universe_date_adj(universe, universe_begin_date, universe_end_date)
+
+#run function
+ds_vol = ds_vol(df, period,shift)
+#universe_screen=universe_screen(universe)
+trading_day_check=trading_day_check(df)
+eligible=trading_day_check
+inverse_vol=inverse_vol(ds_vol)
+top100_inverse_vol=top100_inverse_vol(inverse_vol)
+initial_weight=initial_weight(top100_inverse_vol)
+weight=capped_weight(initial_weight)
+final_weight=output(weight)
+
+
+#output
+output_path=r'xxx'
+ds_vol.to_excel(output_path+"/DS_vol.xlsx")
+eligible.to_excel(output_path+"/Eligible.xlsx")
+inverse_vol.to_excel(output_path+"/Inverse_vol.xlsx")
+top100_inverse_vol.to_excel(output_path+"/Top100_inverse_vol.xlsx")
+
+
+print('process done!')
